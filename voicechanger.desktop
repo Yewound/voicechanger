@@ -1,0 +1,19 @@
+[Desktop Entry]
+Categories=AudioVideo;Audio;AudioVideoEditing;
+Comment[ru_RU]=Изменение голоса в реальном времени (PipeWire/PulseAudio)
+Comment=Изменение голоса в реальном времени (PipeWire/PulseAudio)
+Exec=VoiceChanger
+GenericName[ru_RU]=
+GenericName=
+Icon=voicechanger
+Keywords=voice;audio;pitch;microphone;голос;микрофон;
+MimeType=
+Name[ru_RU]=Изменитель голоса
+Name=Изменитель голоса
+StartupNotify=true
+StartupWMClass=VoiceChanger
+Terminal=false
+Type=Application
+Version=1.0
+X-KDE-SubstituteUID=false
+X-KDE-Username=

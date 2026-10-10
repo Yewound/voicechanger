@@ -1,0 +1,14 @@
+#!/bin/bash
+# AppRun — точка входа AppImage: готовит окружение и запускает бинарь.
+SELF="$(readlink -f "$0")"
+APPDIR="${SELF%/*}"
+BIN="$APPDIR/usr/VoiceChanger"
+
+export APPDIR="$APPDIR"
+export LD_LIBRARY_PATH="$BIN${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export QT_PLUGIN_PATH="$BIN/PyQt6/Qt6/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+
+# squashfs доступен только для чтения — работаем из домашнего каталога
+cd "${HOME:-/tmp}"
+
+exec "$BIN/VoiceChanger" "$@"

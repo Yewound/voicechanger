@@ -81,6 +81,7 @@ DEFAULTS = dict(
     echo=0.0, echo_time=0.25, echo_fb=0.35,
     reverb=0.0, room=0.5, formant=0.0,
     harmony=0.0, harm_int=7.0, whisper=0.0, denoise=0.0,
+    scream=0.0, scream_thr=-10.0, scream_boom=0.0,
 )
 
 _pct = lambda v: f"{v} %"
@@ -108,6 +109,9 @@ SLIDER_SPECS = {
     "harm_int":  ("Интервал гармонии:", -12, 12, 1.0, lambda v: f"{v:+d} пт", "Интервал второго голоса"),
     "whisper":   ("Шёпот:", 0, 100, 0.01, _pct, "Превращает голос в шёпот"),
     "denoise":   ("Шумоподавление:", 0, 100, 0.01, _pct, "Спектральное подавление шума"),
+    "scream":      ("Крик-буст:", 0, 100, 0.01, _pct, "Когда кричишь, голос получает мощный бас и перегруз"),
+    "scream_thr":  ("Порог крика:", -30, -3, 1.0, lambda v: f"{v} дБ", "Громче этого уровня включается крик-буст"),
+    "scream_boom": ("Удар (бум):", 0, 100, 0.01, _pct, "Громовой удар в момент прорыва"),
     "gate":      ("Шумодав:", 0, 100, 0.0005, _pct, "Отсекает тихий шум микрофона"),
     "comp":      ("Компрессор:", 0, 100, 0.01, _pct, "Выравнивает громкость"),
     "gain":      ("Громкость:", 0, 250, 0.01, _pct, "Выходная громкость"),
@@ -119,6 +123,7 @@ GROUPS = (
     ("Модуляция", ("vibrato", "vib_rate", "tremolo", "trem_rate", "chorus", "ring", "ring_freq")),
     ("Искажение", ("drive", "crush", "whisper")),
     ("Пространство", ("echo", "echo_time", "echo_fb", "reverb", "room")),
+    ("Крик (для стримеров)", ("scream", "scream_thr", "scream_boom")),
     ("Динамика и чистота", ("denoise", "gate", "comp", "gain")),
 )
 
@@ -171,6 +176,7 @@ PRESETS = {
     "Дуэт":           _p(harmony=0.6, harm_int=7, chorus=0.3, reverb=0.15),
     "Октава вниз":    _p(harmony=0.7, harm_int=-12, bass=2),
     "Студия":         _p(denoise=0.6, gate=0.008, comp=0.5, bass=2, treble=2, gain=1.1),
+    "Крик-буст": _p(gate=0.008, scream=1.0, scream_thr=-10.0, scream_boom=0.7),
 }
 
 
@@ -627,6 +633,63 @@ class Harmonizer:
         return (1.0 - 0.25 * self.mix) * x + 0.75 * self.mix * sh
 
 
+class ScreamBoost:
+    """«Крик-буст» как у стримеров: пока говоришь тихо и нормально, звук чистый.
+    Как только уровень переходит порог (крик), плавно включается тяжёлый бас:
+    усиление низов + суб-октава + перегруз, а в момент прорыва звучит громовой «бум»."""
+    def __init__(self, sr):
+        self.sr = sr
+        self.amount, self.thr_db, self.boom = 0.0, -10.0, 0.0
+        self.a = 0.0                       # насколько «крик» сейчас (0..1), сглаженно
+        self.cool = 0
+        self.calm = 0                      # сколько сэмплов подряд было спокойно
+        self.low = FIRFilter(sr)
+        self.sub_lp = FIRFilter(sr)
+        self.sub = PitchShifter(sr)
+        self.sub.ratio = 0.5               # октава вниз
+        self.low.set_response(lambda f: 10.0 ** ((6.0 / (1.0 + (f / 200.0) ** 2)) / 20.0))
+        self.sub_lp.set_response(lambda f: 1.0 / (1.0 + (f / 160.0) ** 4))
+        n = int(sr * 0.45)
+        t = np.arange(n) / sr
+        f = 38.0 + 70.0 * np.exp(-t / 0.07)                 # частота «падает» 108 -> 38 Гц
+        env = np.minimum(t / 0.004, 1.0) * np.exp(-t / 0.11)
+        crack = np.random.default_rng(5).uniform(-1.0, 1.0, n) * np.exp(-t / 0.012) * 0.35
+        self.burst = np.sin(2.0 * np.pi * np.cumsum(f) / sr) * env * 0.9 + crack
+        self.bpos = len(self.burst)
+
+    def process(self, x):
+        if self.amount <= 1e-3 and self.boom <= 1e-3:
+            self.a, self.bpos = 0.0, len(self.burst)
+            return x
+        n = len(x)
+        pk = float(np.max(np.abs(x)))
+        t = min(1.0, max(0.0, (lin2db(pk) - self.thr_db) / 6.0))
+        k = 1.0 - math.exp(-n / (self.sr * (0.015 if t > self.a else 0.07)))
+        a_new = self.a + (t - self.a) * k
+        env = gain_ramp(self.a, a_new, n)
+        self.cool -= n
+        if self.boom > 1e-3 and self.cool <= 0 and t > 0.5 and self.calm >= self.sr * 0.25:
+            self.bpos, self.cool = 0, int(self.sr * 1.0)      # новый «бум», не чаще раза в секунду
+        if t < 0.15:                                      # гистерезис: сброс только при настоящем крике
+            self.calm += n
+        elif t > 0.5:
+            self.calm = 0
+        self.a = a_new
+        out = x
+        if self.amount > 1e-3:
+            w = self.amount
+            gain = db2lin(12.0 + 14.0 * w)                 # +12...+26 дБ
+            pre = self.low.process(x) + 0.7 * self.sub_lp.process(self.sub.process(x))
+            loud = 0.95 * np.tanh(gain * pre)              # жёсткое ограничение: крик «упирается в потолок»
+            out = x * (1.0 - env) + loud * env
+        if self.bpos < len(self.burst):
+            seg = self.burst[self.bpos:self.bpos + n]
+            out = np.array(out, dtype=np.float64, copy=True)
+            out[:len(seg)] += seg * (0.9 * self.boom)
+            self.bpos += n
+        return out
+
+
 class EffectChain:
     def __init__(self, sample_rate: int):
         self.sr = int(sample_rate)
@@ -648,6 +711,7 @@ class EffectChain:
         self.chorus = Chorus(sr)
         self.echo = Echo(sr)
         self.reverb = Reverb(sr)
+        self.scream = ScreamBoost(sr)
         self.comp = Compressor(sr)
         self.limiter = Limiter(sr)
         self._gain = 1.0
@@ -677,6 +741,7 @@ class EffectChain:
         self.echo.feedback = p["echo_fb"]
         self.reverb.mix, self.reverb.room = p["reverb"], p["room"]
         self.comp.amount = p["comp"]
+        self.scream.amount, self.scream.thr_db, self.scream.boom = p["scream"], p["scream_thr"], p["scream_boom"]
         self.gain_target = p["gain"]
         self._update_tone(p)
 
@@ -717,6 +782,7 @@ class EffectChain:
         y = self.chorus.process(y)
         y = self.echo.process(y)
         y = self.reverb.process(y)
+        y = self.scream.process(y)
         y = self.comp.process(y)
         y = y * gain_ramp(self._gain, self.gain_target, len(y))
         self._gain = self.gain_target
@@ -1096,41 +1162,45 @@ class VirtualMic:
 
 
 class KeepAwake:
-    """Держит выход звуковой карты «разбуженным» тихим потоком (одни нули).
-    Щелчок при включении обычно даёт не наш сигнал, а само железо/усилитель,
-    когда PipeWire будит «заснувшую» карту, поэтому fade в сэмплах ему не помогает."""
+    """Держит выход звуковой карты «разбуженным» тихим потоком (одни нули),
+    пока движок выключен. Когда движок работает, этот поток закрыт: у движка
+    есть свой, и два потока на одной карте друг другу только мешают."""
     def __init__(self):
         self.stream = None
-        self.key = "off"
+        self.key = None
 
-    def start(self, device):
-        if self.stream is not None and self.key == device:
+    def start(self, device, rate=None):
+        key = (device, rate)
+        if self.stream is not None and self.key == key:
             return True
         self.stop()
         saved = os.environ.pop("PULSE_SINK", None)     # нужна реальная карта, а не виртуальный выход
         try:
             try:
                 info = sd.query_devices(device, "output") if device is not None else sd.query_devices(kind="output")
-                sr = int(info["default_samplerate"] or 48000)
+                dsr = int(info["default_samplerate"] or 48000)
                 chans = (2, 1) if int(info["max_output_channels"]) >= 2 else (1,)
             except Exception:
-                sr, chans = 48000, (2, 1)
-            for ch in chans:
-                try:
-                    st = sd.OutputStream(device=device, samplerate=sr, channels=ch, dtype="float32",
-                                         blocksize=2048, callback=lambda out, f, t, s: out.fill(0))
-                    st.start()
-                    self.stream, self.key = st, device
-                    return True
-                except Exception:
-                    continue
+                dsr, chans = 48000, (2, 1)
+            rates = [r for r in (rate, dsr, 48000) if r]
+            rates = [r for n, r in enumerate(rates) if r not in rates[:n]]
+            for sr in rates:
+                for ch in chans:
+                    try:
+                        st = sd.OutputStream(device=device, samplerate=sr, channels=ch, dtype="float32",
+                                             blocksize=2048, callback=lambda out, f, t, s: out.fill(0))
+                        st.start()
+                        self.stream, self.key = st, key
+                        return True
+                    except Exception:
+                        continue
             return False
         finally:
             if saved is not None:
                 os.environ["PULSE_SINK"] = saved
 
     def stop(self):
-        st, self.stream, self.key = self.stream, None, "off"
+        st, self.stream, self.key = self.stream, None, None
         if st is not None:
             try:
                 st.stop()
@@ -2055,6 +2125,8 @@ def wave_points(p: dict, n: int = 72) -> np.ndarray:
     if p["whisper"] > 0:
         w = p["whisper"]
         y = (1 - w) * y + w * np.random.default_rng(3).uniform(-1, 1, n)
+    if p["scream"] > 0:
+        y = np.tanh((1 + 4 * p["scream"]) * y) + 0.35 * p["scream"] * np.sin(0.5 * ph)
     y = y * np.sin(np.pi * x) ** 0.6
     if p["echo"] > 0:
         sh = max(1, int(n * 0.16))
@@ -4162,8 +4234,12 @@ class MainWindow(QMainWindow):
         chk = getattr(self, "awake_check", None)
         if chk is None:
             return
-        if chk.isChecked():
-            self._awake.start(self._awake_device())
+        if chk.isChecked() and not self.engine.running:
+            try:
+                rate = int(self.sr_combo.currentText())
+            except Exception:
+                rate = None
+            self._awake.start(self._awake_device(), rate)
         else:
             self._awake.stop()
 
@@ -4242,6 +4318,7 @@ class MainWindow(QMainWindow):
             return False
         self.engine.mute = self.mute_btn.isChecked()
         self.engine.bypass = self.bypass_btn.isChecked()
+        self._awake.stop()          # у движка свой поток, второй на этой карте не нужен
         self._health_warned = False
         self._set_running_ui(True)
         self.status.setText(f"<span style='color:#22c55e'>●</span> Работает — {self.engine.sr} Гц")
@@ -4264,6 +4341,7 @@ class MainWindow(QMainWindow):
         self._set_running_ui(False)
         self.status.setText("● Остановлено")
         self.stats_label.setText("")
+        self._apply_awake()
 
     def _on_record_toggled(self, checked: bool):
         if checked:
@@ -4619,6 +4697,7 @@ class MainWindow(QMainWindow):
 
         self.monitor_check.setChecked(s.value("monitor", False, type=bool))
         self.awake_check.setChecked(s.value("keep_awake", False, type=bool))
+        self.sr_combo.currentIndexChanged.connect(self._apply_awake)
         if s.value("virtual", False, type=bool) and VirtualMic.available():
             self.vm_check.setChecked(True)
 
